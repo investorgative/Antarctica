@@ -2,9 +2,9 @@
 """
 ANTARCTICA exchange executors.
 
-  DEMO  mirrors every paper trade on Bybit Demo Trading (api-demo.bybit.com) once demo API keys are saved on
-        the website (CONTROL tab) and the executor is ARMED: market entry with a stop-loss on the position,
-        stop moved on every trail, reduce-only market close on exit. Sized with the demo account's own equity.
+  DEMO  mirrors the paper book on Bybit Demo Trading (api-demo.bybit.com) once demo API keys are saved on the
+        website (CONTROL tab) and the executor is ARMED: after every paper re-balance each coin's position is
+        set to paper weight x demo equity x scale_mult with market orders (reduce-only when shrinking).
   LIVE  real money (api.bybit.com). Keys can be stored and the connection tested, but order execution is
         deliberately NOT enabled (LIVE_ENABLED = False). Nothing in this file places a real-money order while
         that flag is False - an armed live executor only logs what it would do.
@@ -194,13 +194,16 @@ def _fmt_px(px, tick):
 
 # ---------------------------------------------------------------- executor (runs inside the trader process)
 class Executor:
+    """Mirrors the paper book: after every paper re-balance each coin's exchange position is set to
+    paper weight x exchange equity x scale_mult (market orders, reduce-only when shrinking)."""
+
     def __init__(self, kind, trader):
         if kind not in HOSTS:
             raise ExecError("unknown executor")
         self.kind, self.trader = kind, trader
         self.cli = None
         self.keys_saved = None
-        self.state = core.read_json(state_path(kind), {}) or {"map": {}, "log": []}
+        self.state = core.read_json(state_path(kind), {}) or {"log": []}
         self.eq = None
         self.last_sync = 0
         self.last_error = None
@@ -232,65 +235,53 @@ class Executor:
         return self.trader.cfg.get(self.kind, {})
 
     def on_event(self, ev):
-        if not self.armed() or ev["type"] not in ("open", "trail", "close"):
+        if ev["type"] != "rebalance" or not self.armed():
             return
         if self.kind == "live" and not LIVE_ENABLED:
-            self._note(f"LIVE disabled in code - would mirror {ev['type']} {ev.get('sym')}")
+            self._note("LIVE disabled in code - would re-balance " + ", ".join(ev.get("syms", [])))
             return
+        self.sync(ev.get("weights", {}))
+
+    def sync(self, weights):
         cli = self._client()
         if not cli:
             return
-        sym = ev["sym"]
-        ins = core.instruments(self.trader.cfg).get(sym, {"qty_step": 0.001, "min_qty": 0.001, "tick": 0.01})
         try:
-            if ev["type"] == "open":
-                p = ev["pos"]
-                if self.eq is None:
-                    self.eq = cli.equity()[0]
-                risk_usd = self.eq * float(self._cfg().get("risk_pct", 1.0)) / 100
-                qty = risk_usd / p["dist"]
-                lev = float(self._cfg().get("max_leverage", 10))
-                qty = min(qty, self.eq * lev / p["entry"])
-                qty = math.floor(qty / ins["qty_step"] + 1e-9) * ins["qty_step"]
-                if qty < ins["min_qty"]:
-                    self._note(f"{sym}: size {qty:g} below the exchange minimum - not mirrored", "warning")
-                    return
-                cli.set_leverage(sym, int(lev))
-                side = "Buy" if p["dir"] == 1 else "Sell"
-                r = cli.market(sym, side, _fmt_qty(qty, ins["qty_step"]), stop=_fmt_px(p["stop"], ins["tick"]))
-                self.state["map"][sym] = {"id": p["id"], "qty": qty, "dir": p["dir"], "order": r.get("orderId")}
-                self._note(f"{sym}: {side} {qty:g} market, stop {p['stop']:.6g}")
-            elif ev["type"] == "trail":
-                if sym in self.state["map"]:
-                    try:
-                        cli.set_stop(sym, _fmt_px(ev["new"], ins["tick"]))
-                        self._note(f"{sym}: stop -> {ev['new']:.6g}")
-                    except ExecError as e:
-                        if "34040" in str(e):  # not modified
-                            return
-                        raise
-            elif ev["type"] == "close":
-                m = self.state["map"].pop(sym, None)
-                pos = cli.positions().get(sym)
-                if pos:
-                    side = "Sell" if pos["side"] == "Buy" else "Buy"
-                    cli.market(sym, side, pos["size"], reduce=True)
-                    self._note(f"{sym}: closed {pos['size']} ({ev['trade']['reason']})")
-                elif m:
-                    self._note(f"{sym}: already flat on the exchange (stop filled there)")
-            core.save_json(state_path(self.kind), self.state)
+            self.eq = cli.equity()[0]
+            self.ex_pos = cli.positions()
+            mult = float(self._cfg().get("scale_mult", 1.0))
+            lev = float(self._cfg().get("max_leverage", 8))
+            g = sum(abs(w) for w in weights.values()) * mult
+            k = min(1.0, lev / g) if g > 0 else 1.0
+            prices = self.trader.eng.last_px
+            for sym, w in weights.items():
+                ins = core.instruments(self.trader.cfg).get(sym, {"qty_step": 0.001, "min_qty": 0.001})
+                px = prices.get(sym)
+                if not px:
+                    continue
+                want = w * mult * k * self.eq / px
+                want = math.copysign(math.floor(abs(want) / ins["qty_step"] + 1e-9) * ins["qty_step"], want)
+                if abs(want) < ins["min_qty"] or abs(want) * px < 5:
+                    want = 0.0
+                p = self.ex_pos.get(sym)
+                cur = (float(p["size"]) if p["side"] == "Buy" else -float(p["size"])) if p else 0.0
+                diff = want - cur
+                if abs(diff) * px < max(5.0, 0.01 * self.eq) and want != 0 and (want > 0) == (cur > 0):
+                    continue
+                if abs(diff) < ins["qty_step"] / 2:
+                    continue
+                if cur and (cur > 0) != (diff > 0):  # reduce / close first (reduce-only)
+                    red = min(abs(diff), abs(cur))
+                    cli.market(sym, "Sell" if cur > 0 else "Buy", _fmt_qty(red, ins["qty_step"]), reduce=True)
+                    diff += math.copysign(red, cur)
+                if abs(diff) >= ins["qty_step"] / 2:
+                    cli.set_leverage(sym, int(min(lev, 10)))
+                    cli.market(sym, "Buy" if diff > 0 else "Sell", _fmt_qty(abs(diff), ins["qty_step"]))
+                self._note(f"{sym}: position {cur:+g} -> {want:+g}")
             self.last_error = None
         except Exception as e:
             self.last_error = str(e)
-            self._note(f"{sym}: {ev['type']} failed: {e}", "error")
-            if ev["type"] == "open":  # never leave an unprotected position behind
-                try:
-                    pos = cli.positions().get(sym)
-                    if pos and not float(pos.get("stopLoss") or 0):
-                        cli.market(sym, "Sell" if pos["side"] == "Buy" else "Buy", pos["size"], reduce=True)
-                        self._note(f"{sym}: position closed again because the stop could not be set", "error")
-                except Exception as e2:
-                    self._note(f"{sym}: emergency close failed: {e2}", "error")
+            self._note(f"re-balance failed: {e}", "error")
 
     def tick(self):
         if time.time() - self.last_sync < 60:
@@ -305,21 +296,19 @@ class Executor:
             self.ex_pos = cli.positions()
             self.connected = True
             ctl = core.read_json(control_path(self.kind), {}) or {}
-            if ctl.get("flatten"):
+            if ctl.get("flatten") and (self.kind == "demo" or LIVE_ENABLED):
                 for sym, pos in self.ex_pos.items():
-                    if self.kind == "live" and not LIVE_ENABLED:
-                        break
                     cli.market(sym, "Sell" if pos["side"] == "Buy" else "Buy", pos["size"], reduce=True)
                     self._note(f"{sym}: flattened by user")
-                self.state["map"] = {}
                 set_control(self.kind, flatten=False, armed=False)
-            elif self.armed() and (self.kind == "demo" or LIVE_ENABLED):
-                # reconcile: exchange position without a paper position -> close it
-                for sym, pos in self.ex_pos.items():
-                    if sym in self.trader.syms and sym not in self.trader.eng.pos and sym in self.state["map"]:
-                        cli.market(sym, "Sell" if pos["side"] == "Buy" else "Buy", pos["size"], reduce=True)
-                        self.state["map"].pop(sym, None)
-                        self._note(f"{sym}: reconciled (paper is flat) - closed on the exchange", "warning")
+            elif ctl.get("flatten"):
+                set_control(self.kind, flatten=False)
+            elif ctl.get("sync_now") and self.armed() and (self.kind == "demo" or LIVE_ENABLED):
+                eng = self.trader.eng
+                eqp = eng.equity()
+                self.sync({s: (p["qty"] * eng.last_px.get(s, p["avg"]) / eqp) for s, p in eng.pos.items()} |
+                          {s: 0.0 for s in self.ex_pos if s not in eng.pos})
+                set_control(self.kind, sync_now=False)
             self.last_error = None
         except Exception as e:
             self.connected = False
@@ -330,6 +319,6 @@ class Executor:
         return {"kind": self.kind, "armed": self.armed(), "keys": keys_info(self.kind)["present"],
                 "connected": self.connected, "equity": self.eq, "positions": {
                     s: {"side": p.get("side"), "size": p.get("size"), "entry": p.get("avgPrice"),
-                        "stop": p.get("stopLoss"), "upnl": p.get("unrealisedPnl")} for s, p in self.ex_pos.items()},
+                        "upnl": p.get("unrealisedPnl")} for s, p in self.ex_pos.items()},
                 "last_error": self.last_error, "log": (self.state.get("log") or [])[-15:],
                 "live_enabled": LIVE_ENABLED if self.kind == "live" else True}

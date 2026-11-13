@@ -156,18 +156,20 @@ def live_bundle():
     status = core.read_json(core.STATUS_PATH, {}) or {}
     eng = core.Engine(cfg["strategy"], cfg)
     started = core.now_ms()
-    if st and st.get("engine"):
+    if st and st.get("engine") and st.get("kind") == "ensemble":
         eng.load(st["engine"])
         started = st.get("started") or started
     prices = {s: v.get("price") for s, v in (status.get("symbols") or {}).items() if v.get("price")}
-    b = core.bundle(eng, cfg, started, core.now_ms(), prices=prices or None)
+    if prices:
+        eng.last_px.update(prices)
+    b = core.bundle(eng, cfg, started, core.now_ms(), prices=dict(eng.last_px))
     b["kind"] = "live"
     b["status"] = status
-    b["events"] = (core.read_json(core.EVENTS_PATH, []) or [])[-150:]
-    b["config"] = {"risk_pct": cfg["account"]["risk_pct"], "heat_pct": cfg["account"]["heat_pct"],
-                   "start_balance": cfg["account"]["start_balance"], "max_leverage": cfg["account"]["max_leverage"],
-                   "fees": cfg["fees"], "symbols": cfg["symbols"], "timeframe": cfg["timeframe"],
-                   "strategy": cfg["strategy"], "kelly": cfg["account"]["kelly_sizing"], "timezone": cfg["timezone"]}
+    b["events"] = [e for e in (core.read_json(core.EVENTS_PATH, []) or []) if e.get("type") != "adjust"][-150:]
+    b["config"] = {"start_balance": cfg["account"]["start_balance"], "max_leverage": cfg["account"]["max_leverage"],
+                   "band_pct": cfg["account"]["band_pct"], "fees": cfg["fees"], "symbols": cfg["symbols"],
+                   "timeframe": cfg["timeframe"], "strategy": cfg["strategy"], "kelly": cfg["account"]["kelly_sizing"],
+                   "timezone": cfg["timezone"]}
     b["public_url"] = public_url()
     b["alive"] = bool(status.get("heartbeat") and core.now_ms() - status["heartbeat"] < 120_000)
     _live_cache.update(t=time.time(), v=b)
@@ -191,26 +193,20 @@ def api_chart():
     if sym not in cfg["symbols"]:
         abort(404)
     n = min(1500, max(50, int(request.args.get("n", 400))))
-    p = core.clean_params(cfg["strategy"])
     tfm = int(cfg["timeframe"])
-    store = core.Store()
-    d = store.tail(sym, tfm, n + core.warmup_bars(p))
-    if not len(d["ts"]):
-        return jsonify({"sym": sym, "candles": []})
-    ind = core.indicators(d, p)
-    k = max(0, len(d["ts"]) - n)
-    rows = []
-    for i in range(k, len(d["ts"])):
-        rows.append([int(d["ts"][i]), d["o"][i], d["h"][i], d["l"][i], d["c"][i], d["v"][i],
-                     ind["ema"][i], ind["hh"][i], ind["ll"][i], ind["atr"][i]])
+    d = core.Store().tail(sym, tfm, n)
+    rows = [[int(d["ts"][i]), d["o"][i], d["h"][i], d["l"][i], d["c"][i], d["v"][i]] for i in range(len(d["ts"]))]
     status = core.read_json(core.STATUS_PATH, {}) or {}
     forming = ((status.get("symbols") or {}).get(sym) or {}).get("forming")
     st = core.read_json(core.STATE_PATH, {}) or {}
     e = st.get("engine") or {}
     trades = [t for t in e.get("trades", []) if t.get("sym") == sym][-200:]
     pos = (e.get("pos") or {}).get(sym)
+    # position weight history from the event feed (re-balances)
+    wh = [[ev["ts"], ev["weights"].get(sym, 0.0)] for ev in (core.read_json(core.EVENTS_PATH, []) or [])
+          if ev.get("type") == "rebalance" and sym in (ev.get("weights") or {})]
     out = {"sym": sym, "tf": tfm, "candles": rows, "forming": forming, "trades": trades, "pos": pos,
-           "pending": (e.get("pending") or {}).get(sym), "params": p}
+           "target": (e.get("targets") or {}).get(sym, 0.0), "weights": wh[-400:]}
     return app.response_class(json.dumps(core.clean_json(out)), mimetype="application/json")
 
 
@@ -237,8 +233,11 @@ def start_job(kind, params):
 @app.post("/api/backtest")
 def api_backtest():
     j = request.get_json(silent=True) or {}
-    q = {"days": min(3650, max(7, float(j.get("days") or 365))), "risk": min(20, max(0.05, float(j.get("risk") or _cfg()["account"]["risk_pct"]))),
-         "balance": min(1e9, max(1, float(j.get("balance") or 100))), "heat": min(200, max(0.1, float(j.get("heat") or _cfg()["account"]["heat_pct"]))),
+    cfg = _cfg()
+    q = {"days": min(3650, max(30, float(j.get("days") or 365))),
+         "balance": min(1e9, max(10, float(j.get("balance") or cfg["account"]["start_balance"]))),
+         "scale": min(20, max(0.1, float(j.get("scale") or cfg["strategy"]["scale"]))),
+         "band": min(20, max(0, float(j.get("band") if j.get("band") is not None else cfg["account"]["band_pct"]))),
          "kelly": bool(j.get("kelly", False)), "params": j.get("params")}
     return jsonify({"job": start_job("backtest", q)})
 
@@ -247,9 +246,9 @@ def api_backtest():
 def api_optimize():
     j = request.get_json(silent=True) or {}
     o = _cfg()["optimizer"]
-    q = {"days": min(3650, max(60, float(j.get("days") or o["days"]))), "combos": min(2000, max(5, int(j.get("combos") or o["combos"]))),
-         "train_frac": min(0.9, max(0.3, float(j.get("train_frac") or o["train_frac"]))),
-         "risk": float(j.get("risk") or _cfg()["account"]["risk_pct"]), "heat": float(j.get("heat") or _cfg()["account"]["heat_pct"])}
+    q = {"days": min(3650, max(180, float(j.get("days") or o["days"]))),
+         "combos": min(500, max(3, int(j.get("combos") or o["combos"]))),
+         "train_frac": min(0.9, max(0.3, float(j.get("train_frac") or o["train_frac"])))}
     return jsonify({"job": start_job("optimize", q)})
 
 
@@ -294,19 +293,20 @@ def api_settings_post():
     if "account" in j:
         a = j["account"]
         acc = {}
-        for k, lo, hi in (("risk_pct", 0.05, 20), ("heat_pct", 0.1, 200), ("max_leverage", 1, 100),
-                          ("kelly_fraction", 0.05, 1), ("kelly_max_risk_pct", 0.1, 20), ("minqty_risk_mult", 1, 10)):
+        for k, lo, hi in (("max_leverage", 1, 20), ("band_pct", 0, 20), ("kelly_fraction", 0.05, 1),
+                          ("kelly_max_scale", 0.5, 20)):
             if k in a:
                 acc[k] = min(hi, max(lo, float(a[k])))
         if "kelly_sizing" in a:
             acc["kelly_sizing"] = bool(a["kelly_sizing"])
         if "start_balance" in a:
-            acc["start_balance"] = min(1e9, max(1, float(a["start_balance"])))
+            acc["start_balance"] = min(1e9, max(10, float(a["start_balance"])))
         patch["account"] = acc
+    if "scale" in j:
+        patch["strategy"] = {"scale": min(20, max(0, float(j["scale"])))}
     for kind in ("demo", "live"):
         if kind in j:
-            patch[kind] = {k: min(100 if k == "max_leverage" else 20, max(0.05, float(v))) for k, v in j[kind].items()
-                           if k in ("risk_pct", "max_leverage")}
+            patch[kind] = {k: min(20, max(0.05, float(v))) for k, v in j[kind].items() if k in ("scale_mult", "max_leverage")}
     if "discord" in j:
         d = {}
         for k, v in j["discord"].items():
@@ -364,6 +364,8 @@ def api_exec():
             execmod.set_control(kind, armed=False)
         elif action == "flatten":
             execmod.set_control(kind, flatten=True)
+        elif action == "sync":
+            execmod.set_control(kind, sync_now=True)
         else:
             return jsonify({"ok": False, "error": "unknown action"}), 400
         log.info(f"{kind} executor: {action}")

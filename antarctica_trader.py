@@ -2,13 +2,12 @@
 """
 ANTARCTICA live paper trader (tmux session "Antarctica").
 
-Every `poll_seconds` it pulls the latest 6h candles of all 12 coins from Bybit, and
-  * while a candle is forming:   checks the protective stops against the forming high/low (paper fill at the stop)
-  * when a candle closes:        waits until EVERY coin has that closed candle, then runs the same two-phase
-                                 protocol as the backtester (phase 1 fills at the open for all coins, phase 2
-                                 stops / funding / trailing / time stop / new signals for all coins)
-After a crash or downtime it replays the missed closed candles in order, so the paper account stays identical
-to what the backtester computes for the same period.
+Every `poll_seconds` it pulls the latest 4h candles of all 12 coins from Bybit. When a candle has closed for
+EVERY coin it runs exactly the backtester's protocol:
+  close of candle t : funding of candle t, mark-to-market, target weights from candles/funding up to t
+  open of candle t+1: re-balance the paper book to those weights at the open price (taker fee + slippage)
+After downtime it replays the missed candles in order, so the paper account stays identical to a backtest of
+the same period.
 
   python antarctica_trader.py            run
   python antarctica_trader.py --reset    wipe the paper account (start again with the configured balance)
@@ -16,10 +15,12 @@ to what the backtester computes for the same period.
 import argparse
 import os
 import signal
-import sys
 import time
 
+import numpy as np
+
 import antarctica_core as core
+import antarctica_strategy as strat
 
 log = core.setup_logging("trader")
 
@@ -49,170 +50,178 @@ class Trader:
         self.wait_since = {}
         self.executors = {}
 
-    # ---------------------------------------------------------------- setup
     def _mtime(self):
         try:
             return os.path.getmtime(core.CONFIG_PATH)
         except Exception:
             return 0
 
-    def _funding(self, sym, a, b):
+    def _funding_src(self, sym, a, b):
         if not self.cfg["fees"].get("include_funding", True):
             return {}
-        try:
-            self.store.ensure_funding(sym, a - 8 * core.HOUR, b)
-        except Exception as e:
-            log.warning(f"{sym}: funding download failed: {e}")
         return self.store.load_funding(sym, a, b)
 
     def _new_engine(self):
         last_closed = (core.now_ms() // self.tf - 1) * self.tf
-        eng = core.Engine(self.cfg["strategy"], self.cfg, funding=self._funding, trade_from=last_closed + self.tf)
-        for s in self.syms:  # nothing to replay for a brand-new account
-            eng.seen_ts[s] = last_closed
-            eng.closed_ts[s] = last_closed
+        eng = core.Engine(self.cfg["strategy"], self.cfg, funding=self._funding_src, trade_from=last_closed + self.tf)
+        eng.last_close_ts = last_closed - self.tf  # the last closed candle sets the first targets
+        eng.last_open_ts = last_closed
         return eng
 
     def load_state(self):
         st = core.read_json(core.STATE_PATH, None)
         self.eng = self._new_engine()
-        if st and st.get("engine"):
+        if st and st.get("engine") and st.get("kind") == "ensemble":
             self.eng.load(st["engine"])
             self.started = st.get("started")
-            log.info(f"state loaded: balance ${self.eng.balance:.2f}, {len(self.eng.trades)} trades, "
+            log.info(f"state loaded: equity ${self.eng.equity():,.2f}, {len(self.eng.trades)} closed trades, "
                      f"{len(self.eng.pos)} open positions")
         else:
+            if st:
+                log.warning("old state file (different strategy) ignored - starting a new paper account")
             self.started = core.now_ms()
-            log.info(f"new paper account: ${self.eng.balance:.2f}")
+            log.info(f"new paper account: ${self.eng.cash:,.2f}")
+        self.eng.funding = self._funding_src
         self.apply_config(initial=True)
 
     def save_state(self):
-        core.save_json(core.STATE_PATH, {"engine": self.eng.export(), "started": self.started, "version": core.VERSION,
-                                         "symbols": self.syms, "timeframe": self.tfm, "saved": core.now_ms()})
+        e = self.eng
+        if len(e.curve) > 6000:  # keep the live curve compact: thin old points to one per day
+            old, new = e.curve[:-1500], e.curve[-1500:]
+            keep, seen = [], set()
+            for c in old:
+                d = c[0] // core.DAY
+                if d not in seen:
+                    seen.add(d)
+                    keep.append(c)
+            e.curve = keep + new
+        core.save_json(core.STATE_PATH, {"engine": e.export(), "started": self.started, "version": core.VERSION,
+                                         "kind": "ensemble", "symbols": self.syms, "timeframe": self.tfm,
+                                         "saved": core.now_ms()})
 
     def apply_config(self, initial=False):
-        """strategy / risk changes from the website take effect for new signals"""
         cfg = core.load_config()
         self.cfg = cfg
         e = self.eng
         a = cfg["account"]
         e.p = core.clean_params(cfg["strategy"])
-        e.risk_pct = float(a["risk_pct"])
-        e.heat_pct = float(a.get("heat_pct", 12))
-        e.max_lev = float(a.get("max_leverage", 10))
+        e.max_lev = float(a.get("max_leverage", 8))
+        e.band = float(a.get("band_pct", 2)) / 100
         e.kelly = bool(a.get("kelly_sizing", False))
         e.kelly_frac = float(a.get("kelly_fraction", 0.5))
-        e.kelly_max = float(a.get("kelly_max_risk_pct", 4.0))
-        e.minqty_mult = float(a.get("minqty_risk_mult", 2.0))
+        e.kelly_max = float(a.get("kelly_max_scale", 6))
         e.instr = core.instruments(cfg)
         e.taker, e.maker, e.slip = cfg["fees"]["taker"], cfg["fees"]["maker"], cfg["fees"].get("slippage", 0.0)
         if not initial:
-            log.info(f"config reloaded: risk {e.risk_pct}% heat {e.heat_pct}% params {e.p}")
+            log.info(f"config reloaded: scale {e.p['scale']}x band {e.band * 100:.1f}% params {e.p}")
 
     def warmup(self):
-        p = core.clean_params(self.cfg["strategy"])
-        need = core.warmup_bars(p) + 60
+        need = strat.warmup_bars(self.cfg["strategy"]) + 80
         now = core.now_ms()
         for s in self.syms:
             for attempt in range(5):
                 try:
                     self.store.ensure(s, self.tfm, now - need * self.tf, now)
+                    self.store.ensure_funding(s, now - need * self.tf, now)
                     break
-                except Exception as e:
-                    log.warning(f"{s}: history download failed ({e}), retry {attempt + 1}/5")
+                except Exception as ex:
+                    log.warning(f"{s}: history download failed ({ex}), retry {attempt + 1}/5")
                     time.sleep(5 * (attempt + 1))
         core.refresh_instruments(self.cfg, log)
         self.eng.instr = core.instruments(self.cfg)
 
-    # ---------------------------------------------------------------- per candle
-    def _ind_at(self, sym, ts):
-        p = self.eng.p
-        n = core.warmup_bars(p) + 5
-        d = self.store.tail(sym, self.tfm, n, end=ts)
-        if not len(d["ts"]) or int(d["ts"][-1]) != ts:
-            return None, None, None
-        ind = core.indicators(d, p)
-        i = len(d["ts"]) - 1
-        bar = (int(d["ts"][i]), float(d["o"][i]), float(d["h"][i]), float(d["l"][i]), float(d["c"][i]), float(d["v"][i]))
-        N = p["entry_n"]
-        nxt = (float(d["h"][-N:].max()), float(d["l"][-N:].min())) if len(d["ts"]) >= N else None
-        return bar, tuple(float(ind[k][i]) for k in core.IND_KEYS), nxt
-
-    def process_closed(self, t):
-        """two-phase protocol for closed candle time t (all symbols)"""
-        bars = {}
+    # ---------------------------------------------------------------- candle processing
+    def _weights_for(self, ts_list):
+        """target weights (and sleeves) for the closed candles in ts_list, from the stored history"""
+        need = strat.warmup_bars(self.eng.p) + 20
+        lo = ts_list[0] - need * self.tf
+        datas, funding = {}, {}
         for s in self.syms:
-            if t <= self.eng.closed_ts.get(s, 0):
-                continue
-            bar, ind, nxt = self._ind_at(s, t)
-            if bar:
-                bars[s] = (bar, ind, nxt)
-        for s in self.syms:
-            if s in bars:
-                self.eng.open_bar(s, t, bars[s][0][1])
-        for s in self.syms:
-            if s in bars:
-                self.eng.process(s, bars[s][0], bars[s][1], True)
-                self.eng.last[s + "#next"] = bars[s][2]
-        for s in self.syms:  # a symbol without this candle (exchange gap) must not block the others forever
-            if s not in bars and t > self.eng.closed_ts.get(s, 0):
-                self.eng.closed_ts[s] = t
-                self.eng.seen_ts[s] = max(self.eng.seen_ts.get(s, 0), t)
+            d = self.store.load(s, self.tfm, lo, ts_list[-1])
+            if len(d["ts"]):
+                datas[s] = d
+            funding[s] = self.store.load_funding(s, lo, ts_list[-1] + self.tf - 1)
+        T, O, H, L, C, FR = core.load_panel(datas, funding, self.cfg)
+        W, SL = strat.compute(T, C, FR, self.eng.p, self.tf, detail=True)
+        out = {}
+        for t in ts_list:
+            i = int(np.searchsorted(T, t))
+            if i < len(T) and T[i] == t:
+                out[t] = ({s: float(W[i, j]) for j, s in enumerate(self.syms) if C[i, j] == C[i, j]},
+                          {s: float(O[i, j]) for j, s in enumerate(self.syms) if O[i, j] == O[i, j]},
+                          {s: float(C[i, j]) for j, s in enumerate(self.syms) if C[i, j] == C[i, j]},
+                          {k: {s: float(v[i, j]) for j, s in enumerate(self.syms)} for k, v in SL.items()})
+        return out
 
     def poll(self):
         now = core.now_ms()
-        cur = now // self.tf * self.tf  # open time of the forming candle
-        target = cur - self.tf  # last closed candle
-        got = {}
+        cur = now // self.tf * self.tf
+        target = cur - self.tf
         for s in self.syms:
             try:
                 rows = self.api.klines(s, self.tfm, limit=4, tries=2)
-            except Exception as e:
-                log.warning(f"{s}: kline poll failed: {e}")
+            except Exception as ex:
+                log.warning(f"{s}: kline poll failed: {ex}")
                 continue
             self.store.insert(s, self.tfm, rows, closed_before=now)
-            got[s] = rows
             fr = [r for r in rows if r[0] == cur]
             if fr:
                 self.forming[s] = fr[0]
         try:
             self.tickers = {k: v for k, v in self.api.tickers().items() if k in self.syms}
-        except Exception as e:
-            log.warning(f"ticker poll failed: {e}")
-        # ---- closed candles not processed yet (replays downtime too)
-        todo = set()
-        mn_closed = min(self.eng.closed_ts.get(s, 0) for s in self.syms)
-        if mn_closed < target:
-            missing = [s for s in self.syms if self.store.bounds(s, self.tfm)[1] is None
-                       or self.store.bounds(s, self.tfm)[1] < target]
+        except Exception as ex:
+            log.warning(f"ticker poll failed: {ex}")
+        e = self.eng
+        if target - e.last_close_ts > 2 * self.tf:  # downtime: fill the whole gap, not only the newest candles
+            for s in self.syms:
+                try:
+                    self.store.insert(s, self.tfm, self.api.klines_range(s, self.tfm, e.last_close_ts - self.tf, now),
+                                      closed_before=now)
+                except Exception as ex:
+                    log.warning(f"{s}: gap fill failed: {ex}")
+        if e.last_close_ts < target:
+            missing = [s for s in self.syms if (self.store.bounds(s, self.tfm)[1] or 0) < target]
             if missing:
-                # catch up older history for a symbol (downtime) and wait a little for the newest candle
                 for s in missing:
                     try:
-                        self.store.ensure(s, self.tfm, self.eng.closed_ts.get(s, target - self.tf), now)
-                    except Exception as e:
-                        log.warning(f"{s}: catch-up download failed: {e}")
+                        self.store.ensure(s, self.tfm, e.last_close_ts - self.tf, now)
+                    except Exception as ex:
+                        log.warning(f"{s}: catch-up download failed: {ex}")
                 missing = [s for s in self.syms if (self.store.bounds(s, self.tfm)[1] or 0) < target]
             first = self.wait_since.setdefault(target, now)
             if missing and now - first < 180_000:
-                return  # wait until every coin has the closed candle (keeps the two-phase order exact)
+                return  # wait until every coin has the closed candle
             if missing:
                 log.warning(f"candle {core.fmt_ts(target, self.cfg)} missing for {missing} after 3 min - continuing without")
+            # funding of the candles to process must be known first
             for s in self.syms:
-                d = self.store.load(s, self.tfm, self.eng.closed_ts.get(s, 0) + 1, target)
-                todo.update(int(x) for x in d["ts"])
-            for t in sorted(todo):
-                self.process_closed(t)
+                try:
+                    self.store.ensure_funding(s, e.last_close_ts, now)
+                except Exception as ex:
+                    log.warning(f"{s}: funding download failed: {ex}")
+            ts_list = list(range(e.last_close_ts + self.tf, target + 1, self.tf))
+            wmap = self._weights_for(ts_list)
+            for t in ts_list:
+                if t not in wmap:
+                    e.last_close_ts = t
+                    continue
+                tg, opens, closes, sl = wmap[t]
+                e.on_open(t, opens)
+                e.on_close(t, opens, closes, tg, sl)
             self.wait_since = {}
-        # ---- forming candle: fills at its open, then stops on the forming high/low
-        for s in self.syms:
-            fr = self.forming.get(s)
-            if fr and fr[0] == cur:
-                self.eng.open_bar(s, cur, fr[1])
-        for s in self.syms:
-            fr = self.forming.get(s)
-            if fr and fr[0] == cur:
-                self.eng.process(s, fr, None, False)
+        # open of the forming candle: re-balance at its open price
+        opens = {s: fr[1] for s, fr in self.forming.items() if fr[0] == cur}
+        need = set(e.targets) | set(e.pos)
+        if e.last_close_ts == target and e.last_open_ts < cur and opens:
+            lacking = sorted(need - set(opens))
+            first = self.wait_since.setdefault(("open", cur), now)
+            if not lacking or now - first > 180_000:
+                if lacking:
+                    log.warning(f"open prices missing for {lacking} after 3 min - re-balancing without them")
+                e.on_open(cur, opens)
+        for s, fr in self.forming.items():
+            if fr[0] == cur:
+                e.last_px[s] = fr[4]
         self.last_poll = now
 
     # ---------------------------------------------------------------- outputs
@@ -220,35 +229,41 @@ class Trader:
         evs, self.eng.events = self.eng.events, []
         for ev in evs:
             core.push_event(ev)
-            if ev["type"] in ("open", "trail", "close", "skip"):
+            if ev["type"] in ("open", "adjust", "close"):
                 msg = core.fmt_discord(ev, self.cfg)
                 url = self.cfg["discord"].get(ev.get("sym", ""), "")
                 if msg and url:
                     core.discord_send(url, msg)
-                if ev["type"] in ("open", "close"):
-                    log.info(f"{ev['type'].upper()} {ev.get('sym')} " + (
-                        f"{'LONG' if ev['pos']['dir'] == 1 else 'SHORT'} qty {ev['pos']['qty']:g} @ {core.fmt_px(ev['pos']['entry'])} stop {core.fmt_px(ev['pos']['stop'])}"
-                        if ev["type"] == "open" else
-                        f"{ev['trade']['reason']} @ {core.fmt_px(ev['trade']['exit'])} pnl ${ev['trade']['pnl']:+.2f} ({ev['trade']['r']:+.2f} R)"))
+            if ev["type"] == "rebalance":
+                log.info(f"rebalanced {len(ev['syms'])} coins, equity ${ev['equity']:,.2f}")
+                if self.cfg["discord"].get("rebalance_summary", True):
+                    core.discord_send(self.cfg["discord"].get("errors", ""), core.fmt_rebalance(ev, self.cfg))
+            if ev["type"] == "close":
+                t = ev["trade"]
+                log.info(f"CLOSE {ev['sym']} {'LONG' if t['dir'] > 0 else 'SHORT'} pnl ${t['pnl']:+.2f} ({t['r']:+.2f} R)")
             if execmod:
                 for kind, ex in self.executors.items():
                     try:
                         ex.on_event(ev)
-                    except Exception as e:
-                        log.error(f"{kind} executor: {e}")
+                    except Exception as err:
+                        log.error(f"{kind} executor: {err}")
 
     def write_status(self):
         e = self.eng
         sy = {}
+        prices = {}
         for s in self.syms:
-            last = e.last.get(s)
-            sy[s] = core.signal_status(s, e, last[0] if last else None, last[1] if last else None,
-                                       self.forming.get(s), e.last.get(s + "#next"))
-            sy[s]["forming"] = self.forming.get(s)
             t = self.tickers.get(s) or {}
-            sy[s]["price"] = float(t.get("lastPrice") or (self.forming.get(s) or [0, 0, 0, 0, 0])[4] or 0)
-            sy[s]["chg24"] = float(t.get("price24hPcnt") or 0) * 100
-            sy[s]["funding_rate"] = float(t.get("fundingRate") or 0)
+            px = float(t.get("lastPrice") or (self.forming.get(s) or [0, 0, 0, 0, 0])[4] or 0)
+            prices[s] = px
+            sy[s] = {"price": px, "chg24": float(t.get("price24hPcnt") or 0) * 100,
+                     "funding_rate": float(t.get("fundingRate") or 0), "forming": self.forming.get(s),
+                     "target": e.targets.get(s, 0.0),
+                     "sleeves": {k: v.get(s, 0.0) for k, v in (e.sleeves or {}).items()}}
+        eq = e.equity({k: v for k, v in prices.items() if v})
+        for s in self.syms:
+            ps = e.pos.get(s)
+            sy[s]["weight"] = ps["qty"] * prices[s] / eq if ps and eq > 0 and prices[s] else 0.0
         execs = {}
         for kind, ex in self.executors.items():
             try:
@@ -258,9 +273,9 @@ class Trader:
         core.save_json(core.STATUS_PATH, {
             "heartbeat": core.now_ms(), "last_poll": self.last_poll, "started": self.started, "version": core.VERSION,
             "timeframe": self.tfm, "next_close": (core.now_ms() // self.tf + 1) * self.tf, "symbols": sy,
-            "balance": e.balance, "equity": e.equity({s: v["price"] for s, v in sy.items() if v.get("price")}),
-            "open_heat": e.open_heat(), "heat_pct": e.heat_pct, "risk_pct": e.current_risk_pct(),
-            "params": e.p, "pending": e.pending, "executors": execs, "pid": os.getpid()})
+            "cash": e.cash, "equity": eq, "gross": e.gross({k: v for k, v in prices.items() if v}) / eq if eq > 0 else 0,
+            "scale": e.cur_scale, "kelly_scale": e.kelly_scale(), "params": e.p, "target_ts": e.target_ts,
+            "last_close_ts": e.last_close_ts, "executors": execs, "pid": os.getpid()})
 
     def setup_executors(self):
         if not execmod:
@@ -271,7 +286,6 @@ class Trader:
             except Exception as ex:
                 log.error(f"{kind} executor not available: {ex}")
 
-    # ---------------------------------------------------------------- main loop
     def run(self):
         signal.signal(signal.SIGTERM, lambda *a: setattr(self, "stop", True))
         log.info(f"ANTARCTICA paper trader v{core.VERSION} starting - {len(self.syms)} coins, {self.tfm // 60}h candles")
@@ -279,9 +293,9 @@ class Trader:
         self.warmup()
         self.setup_executors()
         if self.cfg["discord"].get("notify_start", True):
-            url = self.cfg["discord"].get("errors", "")
-            core.discord_send(url, f"🧊 **ANTARCTICA** paper trader started · balance ${self.eng.balance:,.2f} · "
-                                   f"{len(self.eng.pos)} open positions")
+            core.discord_send(self.cfg["discord"].get("errors", ""),
+                              f"🧊 **ANTARCTICA** paper trader started · equity ${self.eng.equity():,.2f} · "
+                              f"{len(self.eng.pos)} open positions · scale {self.eng.p['scale']}x")
         while not self.stop:
             t0 = time.time()
             try:
@@ -295,16 +309,16 @@ class Trader:
                 for ex in self.executors.values():
                     try:
                         ex.tick()
-                    except Exception as e:
-                        log.error(f"executor tick: {e}")
+                    except Exception as err:
+                        log.error(f"executor tick: {err}")
                 self.poll_errors = 0
-            except Exception as e:
+            except Exception as ex:
                 self.poll_errors += 1
-                log.error(f"poll failed ({self.poll_errors}x): {e}", exc_info=self.poll_errors <= 2)
+                log.error(f"poll failed ({self.poll_errors}x): {ex}", exc_info=self.poll_errors <= 2)
             try:
                 self.write_status()
-            except Exception as e:
-                log.error(f"status write failed: {e}")
+            except Exception as ex:
+                log.error(f"status write failed: {ex}")
             time.sleep(max(1.0, float(self.cfg.get("poll_seconds", 15)) - (time.time() - t0)))
         self.save_state()
         log.info("trader stopped")
